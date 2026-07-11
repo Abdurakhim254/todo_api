@@ -1,0 +1,149 @@
+name: Deploy Todo API (Docker + Swarm)
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  DO_REGISTRY_URL: registry.digitalocean.com/mahsulottop
+  IMAGE_NAME: todo-api-node
+  APP_DIR: /root/todo_api
+  APP_NAME: todo_api
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ─── 1. CLONE ────────────────────────────────────────────────────────
+      - name: Clone Repository
+        uses: actions/checkout@v4
+
+      # ─── 2. BUILD DOCKER IMAGE ───────────────────────────────────────────
+      - name: Write Dockerfile
+        run: |
+          cat > Dockerfile << 'EOF'
+          FROM node:22-alpine AS builder
+          WORKDIR /usr/src/app
+          COPY package*.json ./
+          RUN npm ci
+          COPY . .
+          RUN npm run build
+          RUN npm prune --omit=dev
+          FROM node:22-alpine
+          WORKDIR /usr/src/app
+          ENV NODE_ENV=production
+          COPY package*.json ./
+          COPY --from=builder /usr/src/app/node_modules ./node_modules
+          COPY --from=builder /usr/src/app/dist ./dist
+          EXPOSE 4000
+          CMD ["node", "dist/main"]
+          EOF
+
+      - name: Write .dockerignore
+        run: |
+          cat > .dockerignore << 'EOF'
+          .git
+          node_modules
+          dist
+          .env
+          .env.*
+          *.log
+          EOF
+
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:latest -t ${{ env.IMAGE_NAME }}:${{ github.run_number }} .
+
+      # ─── 3. PUSH TO DO REGISTRY ──────────────────────────────────────────
+      - name: Push Image to Registry
+        run: |
+          echo "${{ secrets.DO_REGISTRY_TOKEN }}" | docker login registry.digitalocean.com/mahsulottop \
+            -u "${{ secrets.DO_REGISTRY_USERNAME }}" --password-stdin
+
+          docker tag ${{ env.IMAGE_NAME }}:latest ${{ env.DO_REGISTRY_URL }}/${{ env.IMAGE_NAME }}:latest
+          docker tag ${{ env.IMAGE_NAME }}:${{ github.run_number }} ${{ env.DO_REGISTRY_URL }}/${{ env.IMAGE_NAME }}:${{ github.run_number }}
+
+          docker push ${{ env.DO_REGISTRY_URL }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.DO_REGISTRY_URL }}/${{ env.IMAGE_NAME }}:${{ github.run_number }}
+
+      # ─── 4. DEPLOY TO DOCKER SWARM ───────────────────────────────────────
+      - name: Deploy to Swarm
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.BACKEND_SERVER }}
+          username: ${{ secrets.BACKEND_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            echo "${{ secrets.DO_REGISTRY_TOKEN }}" | docker login registry.digitalocean.com/mahsulottop -u "${{ secrets.DO_REGISTRY_USERNAME }}" --password-stdin
+            docker service update \
+              --image ${{ env.DO_REGISTRY_URL }}/${{ env.IMAGE_NAME }}:${{ github.run_number }} \
+              --with-registry-auth \
+              ${{ env.APP_NAME }}
+            echo "Deploy buyrugi berildi. Service yangilanmoqda..."
+
+      # ─── 5. VERIFY HEALTH ────────────────────────────────────────────────
+      - name: Verify Health
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.BACKEND_SERVER }}
+          username: ${{ secrets.BACKEND_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            echo "==> 45 soniya kutamiz (start_period + rolling update)..."
+            sleep 45
+
+            for i in 1 2 3 4 5; do
+                REPLICAS=$(docker service ls --filter name=${{ env.APP_NAME }} --format "{{.Replicas}}" 2>/dev/null)
+                echo "Urinish $i/5 — Replicas: $REPLICAS"
+
+                if [ "$REPLICAS" = "1/1" ]; then
+                    HEALTH=$(curl -sf http://127.0.0.1:4000/api/v1/health-check 2>/dev/null || echo "curl failed")
+                    echo "Health endpoint: $HEALTH"
+                    if echo "$HEALTH" | grep -qi "ok"; then
+                        echo "Service: $REPLICAS | Health: OK"
+                        echo "Deploy muvaffaqiyatli yakunlandi!"
+                        exit 0
+                    fi
+                fi
+
+                sleep 10
+            done
+
+            echo "Service 1/1 holatiga kelmadi yoki health check o'tmadi"
+            docker service ps ${{ env.APP_NAME }} --no-trunc 2>&1 | head -10
+            exit 1
+
+      # ─── POST ACTIONS ────────────────────────────────────────────────────
+      - name: Notify Telegram - Success
+        if: success()
+        run: |
+          MESSAGE="✅ TODO API — DEPLOY OK
+
+          Build: #${{ github.run_number }}
+          Branch: main
+          Author: ${{ github.actor }}
+          Commit: ${{ github.sha }}
+          Message: ${{ github.event.head_commit.message }}
+
+          🐳 Docker Swarm todo_api yangilandi"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode text="$MESSAGE"
+
+      - name: Notify Telegram - Failure
+        if: failure()
+        run: |
+          MESSAGE="❌ TODO API — BUILD FAILED
+
+          Build: #${{ github.run_number }}
+          Branch: main
+          Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode text="$MESSAGE"
